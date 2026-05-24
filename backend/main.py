@@ -56,6 +56,8 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from backend.services.classifier_service import ClassifierService
 from backend.services.classifier_v2 import classifier_v2
 from backend.services.classifier_v3 import classifier_v3 # V3 Power Model
+from backend.services.audit_service import AuditLogService, AuditLogAccessError
+from backend.services.onnx_service import onnx_classifier
 from backend.services.ner_service import NERService
 from backend.services.duplicate_service import DuplicateService
 from backend.services.rag_service import RagService
@@ -66,6 +68,89 @@ from backend.services.semantic_duplicate_service import SemanticDuplicateService
 # ---------------------------------------------------------------------------
 # Request / Response models
 # ---------------------------------------------------------------------------
+def get_system_settings(company_id: str) -> dict:
+    defaults = {
+        "ai_confidence_threshold": 0.80,
+        "duplicate_sensitivity": 0.85,
+        "enable_auto_resolve": False
+    }
+    if not supabase or not company_id:
+        return defaults
+    try:
+        res = supabase.table("system_settings").select(
+            "ai_confidence_threshold, duplicate_sensitivity, enable_auto_resolve"
+        ).eq("company_id", company_id).single().execute()
+        if res.data:
+            return {**defaults, **res.data}
+    except Exception as e:
+        print(f"[WARNING] Could not fetch system_settings for company_id={company_id}: {e}")
+    return defaults
+
+
+def get_duplicate_threshold(company_id: str | None, fallback: float = 0.85) -> float:
+    if not company_id:
+        return fallback
+    settings = get_system_settings(company_id)
+    try:
+        return float(settings.get("duplicate_sensitivity", fallback))
+    except (TypeError, ValueError):
+        return fallback
+
+
+def detect_semantic_duplicate(text: str, *, company_id: str | None, threshold: float) -> dict:
+    try:
+        return duplicate_service.find_semantic_duplicate(
+            text,
+            threshold=threshold,
+            company_id=company_id,
+            supabase_client=supabase,
+        )
+    except Exception as error:
+        print(f"[WARNING] Duplicate detection fallback activated: {error}")
+        duplicate_result = duplicate_service.check_duplicate(text, threshold=threshold)
+        duplicate_result["parent_ticket_id"] = duplicate_result.get("duplicate_ticket_id")
+        duplicate_result["is_potential_duplicate"] = duplicate_result.get("is_duplicate", False)
+        return duplicate_result
+
+
+def classify_ticket_text(text: str) -> dict:
+    """Run the local classifier cascade with ONNX as the offline fallback path."""
+    try:
+        classification_v3_res = classifier_v3.predict(text)
+        if "error" not in classification_v3_res:
+            cat = classification_v3_res.get("Category", {}).get("prediction", "Unknown")
+            sub = classification_v3_res.get("Subcategory", {}).get("prediction", "Unknown")
+            pri = classification_v3_res.get("priority", {}).get("prediction", "Medium")
+            conf = classification_v3_res.get("Category", {}).get("confidence", 0.0)
+
+            from backend.services.classifier_service import TEAM_MAP, AUTO_RESOLVE_SUBS
+            return {
+                "category": cat,
+                "subcategory": sub,
+                "priority": pri,
+                "auto_resolve": sub in AUTO_RESOLVE_SUBS,
+                "assigned_team": TEAM_MAP.get(cat, "General Support"),
+                "confidence": float(conf),
+            }
+    except Exception:
+        traceback.print_exc()
+
+    try:
+        onnx_result = onnx_classifier.predict(text)
+        if onnx_result:
+            return onnx_result
+    except Exception as error:
+        print(f"[ONNX] Fallback classification skipped: {error}")
+
+    try:
+        return classifier_service.predict(text)
+    except Exception:
+        traceback.print_exc()
+        return {
+            "category": "Unknown", "subcategory": "Unknown", "priority": "Medium",
+            "auto_resolve": False, "assigned_team": "General Support", "confidence": 0.0,
+        }
+
 class TicketRequest(BaseModel):
     text: str
     image_base64: str = ""
@@ -92,12 +177,15 @@ class TicketSaveRequest(BaseModel):
     company: str | None = None
     company_id: str | None = None
     sla_breach_at: str
-    metadata: dict
+    sla_status: str | None = None
+    escalation_level: int = 0
+    metadata: dict = {}
     entities: list = []
     solution_steps: list = []
     ocr_text: str = ""
     needs_review: bool = False
-    routing_confidence: float
+    routing_confidence: float = 0.0
+
 
 
 class DuplicateInfo(BaseModel):
@@ -157,6 +245,24 @@ class TicketRecord(BaseModel):
     messages: list[Message] = []
     metadata: dict = {}
     timeline: dict = {} # Milestones: created, analyzed, triaged, routed, in_progress, resolved
+
+
+class AuditLogProfile(BaseModel):
+    full_name: str | None = None
+    email: str | None = None
+    profile_picture: str | None = None
+
+
+class AuditLogRecord(BaseModel):
+    id: str
+    ticket_id: str
+    company_id: str
+    performed_by: str | None = None
+    action: str
+    old_value: dict | list | str | None = None
+    new_value: dict | list | str | None = None
+    created_at: str
+    performed_by_profile: AuditLogProfile | None = None
 
 
 # --- In-Memory Database (to be replaced with SQL later) ---
@@ -220,6 +326,10 @@ async def lifespan(app: FastAPI):
         rag_service.load()
     except Exception as e:
         print(f"[WARNING] RAG service not loaded: {e}")
+    try:
+        onnx_classifier.load()
+    except Exception as e:
+        print(f"[WARNING] ONNX classifier fallback not loaded: {e}")
     
     if gemini_service:
         print(f"[Startup] Gemini Service: {'Initialized' if gemini_service._initialized else 'FAILED (Key missing or SDK error)'}")
@@ -245,6 +355,7 @@ async def lifespan(app: FastAPI):
         print("[Startup] SLA background checker started (interval=300s)")
 
     print("[Startup] Classifier V2 Shadow: Ready.")
+    print(f"[Startup] ONNX MiniLM Fallback: {'READY' if getattr(onnx_classifier, '_loaded', False) else 'DEGRADED (artifacts missing)'}")
     print("[Startup] Ready.")
     yield
     print("[Shutdown] Cleaning up ...")
@@ -538,45 +649,43 @@ async def save_ticket(request_body: TicketSaveRequest):
         raise HTTPException(status_code=500, detail="Supabase connection not initialized.")
 
     logger = logging.getLogger(__name__)
+    final_data = request_body.model_dump()
+
+    # Resolve tenant linkage from user profile with authorization validation.
+    profile = {}
+    if request_body.user_id:
+        try:
+            profile_res = (
+                supabase.table("profiles")
+                .select("company_id, company")
+                .eq("id", request_body.user_id)
+                .single()
+                .execute()
+            )
+            profile = profile_res.data or {}
+            if not profile:
+                raise HTTPException(status_code=404, detail="User profile not found")
+        except HTTPException:
+            raise
+        except Exception as profile_error:
+            logger.error(f"Tenant resolution error for user {request_body.user_id}: {profile_error}")
+            raise HTTPException(status_code=503, detail="Failed to resolve tenant linkage") from profile_error
+
+    # Validate tenant consistency and authorization.
+    profile_company_id = profile.get("company_id")
+    if final_data.get("company_id"):
+        # User provided company_id: verify it matches their profile.
+        if profile_company_id and final_data["company_id"] != profile_company_id:
+            logger.warning(f"Tenant mismatch: user {request_body.user_id} attempted {final_data['company_id']}, assigned to {profile_company_id}")
+            raise HTTPException(status_code=403, detail="User not authorized for this tenant")
+    elif profile_company_id:
+        # Backfill company_id from profile.
+        final_data["company_id"] = profile_company_id
+    elif request_body.user_id:
+        # User has no tenant assignment.
+        raise HTTPException(status_code=400, detail="User has no tenant assignment")
+
     try:
-        final_data = request_body.dict()
-
-        # Resolve tenant linkage from user profile with authorization validation.
-        profile = {}
-        if request_body.user_id:
-            try:
-                profile_res = (
-                    supabase.table("profiles")
-                    .select("company_id, company")
-                    .eq("id", request_body.user_id)
-                    .single()
-                    .execute()
-                )
-                profile = profile_res.data or {}
-                if not profile:
-                    raise HTTPException(status_code=404, detail="User profile not found")
-            except HTTPException:
-                raise
-            except Exception as profile_error:
-                user_hash = hashlib.sha256(str(request_body.user_id).encode()).hexdigest()[:8]
-                logger.error(f"Tenant resolution error for user {user_hash}: {profile_error}")
-                raise HTTPException(status_code=503, detail="Failed to resolve tenant linkage") from profile_error
-
-        # Validate tenant consistency and authorization.
-        profile_company_id = profile.get("company_id")
-        if final_data.get("company_id"):
-            # User provided company_id: verify it matches their profile.
-            if profile_company_id and final_data["company_id"] != profile_company_id:
-                user_hash = hashlib.sha256(str(request_body.user_id).encode()).hexdigest()[:8]
-                logger.warning(f"Tenant mismatch: user {user_hash} attempted {final_data['company_id']}, assigned to {profile_company_id}")
-                raise HTTPException(status_code=403, detail="User not authorized for this tenant")
-        elif profile_company_id:
-            # Backfill company_id from profile.
-            final_data["company_id"] = profile_company_id
-        elif request_body.user_id:
-            # User has no tenant assignment.
-            raise HTTPException(status_code=400, detail="User has no tenant assignment")
-
         # Backfill company name if missing.
         if not final_data.get("company") and profile.get("company"):
             final_data["company"] = profile["company"]
@@ -604,7 +713,29 @@ async def save_ticket(request_body: TicketSaveRequest):
         except Exception as e:
             logger.warning(f"[DUPLICATE] Semantic check error (non-fatal): {e}")
 
-        res = supabase.table("tickets").insert(final_data).execute()
+        # --- Sanitize payload to only include valid Supabase DB columns ---
+        # Extra AI telemetry and non-existent schema fields are merged into the metadata JSONB column
+        # to avoid 400/500 errors from unknown column names in the insert call.
+        VALID_TICKET_COLUMNS = {
+            "user_id", "subject", "description", "category", "subcategory",
+            "priority", "assigned_team", "status", "auto_resolve", "is_duplicate",
+            "confidence", "image_url", "company", "company_id", "sla_breach_at", "metadata",
+        }
+        # Merge any extra telemetry and SLA/duplicate fields into metadata before filtering
+        existing_metadata = final_data.get("metadata") or {}
+        extra_keys = (
+            "entities", "solution_steps", "ocr_text", "needs_review", "routing_confidence",
+            "is_potential_duplicate", "parent_ticket_id", "sla_response_due_at", "sla_status", "escalation_level"
+        )
+        for extra_key in extra_keys:
+            if extra_key in final_data and final_data[extra_key] not in (None, "", [], {}):
+                existing_metadata[extra_key] = final_data[extra_key]
+        final_data["metadata"] = existing_metadata
+
+        # Strip keys not accepted by the DB schema
+        insert_data = {k: v for k, v in final_data.items() if k in VALID_TICKET_COLUMNS}
+
+        res = supabase.table("tickets").insert(insert_data).execute()
         
         if not res.data:
             raise Exception("Failed to insert ticket into database.")
@@ -677,6 +808,19 @@ async def get_ticket_by_id(ticket_id: str):
     return res.data
 
 
+@app.get("/tickets/{ticket_id}/audit_logs", response_model=list[AuditLogRecord])
+async def get_ticket_audit_logs(ticket_id: str, company_id: str):
+    """Return a company-scoped chronological audit trail for a ticket."""
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Database connection not initialized")
+
+    try:
+        service = AuditLogService(supabase)
+        return service.get_ticket_audit_logs(ticket_id, company_id)
+    except AuditLogAccessError as err:
+        raise HTTPException(status_code=err.status_code, detail=err.detail)
+
+
 @app.post("/tickets", response_model=TicketRecord)
 async def create_ticket(ticket: TicketRecord):
     """Save a new ticket into the system."""
@@ -747,7 +891,51 @@ async def analyze_only(request_body: TicketRequest):
     and duplicate check before committing to a ticket creation.
     """
     text = request_body.text
-    print(f"[AI] Starting Analysis (READ-ONLY) for: {text[:50]}...")
+    print(f"[AI] Starting Analysis (READ-ONLY) for: {text[:50]}...") 
+    settings = get_system_settings(request_body.company)
+    confidence_threshold = settings["ai_confidence_threshold"]
+    duplicate_sensitivity = settings["duplicate_sensitivity"]
+    enable_auto_resolve = settings["enable_auto_resolve"]
+
+    # --- Vague Input Guard ---
+    # If the text is extremely short or a generic term, skip AI classification and
+    # return a safe low-priority "General Inquiry" to prevent hallucinated critical categories.
+    import re as _re
+    VAGUE_KEYWORDS = {
+        "demo", "test", "hi", "hello", "check", "try", "ping", "ok", "okay",
+        "issue", "problem", "error", "bug", "help", "hey", "asdf", "xyz",
+        "foo", "bar", "nothing", "something", "stuff",
+    }
+    _stripped = text.strip().lower()
+    _word_count = len(_stripped.split())
+    _is_vague = (len(_stripped) < 15) or (_word_count == 1 and _stripped in VAGUE_KEYWORDS)
+    if _is_vague:
+        import datetime as _dt, uuid as _uuid
+        _sla_breach = calculate_sla_breach_at("Low")
+        print(f"[AI] Vague input detected: '{text}'. Returning safe General Inquiry classification.")
+        return TicketResponse(
+            ticket_id=str(_uuid.uuid4()),
+            summary=f"General inquiry: {text}",
+            category="General",
+            subcategory="General Inquiry",
+            priority="Low",
+            auto_resolve=False,
+            assigned_team="IT Support",
+            entities=[],
+            duplicate_ticket=DuplicateInfo(is_duplicate=False),
+            confidence=0.1,
+            needs_review=True,
+            reasoning="Input was too brief for accurate classification. Please provide more context.",
+            decision_factors=["Input is too short or generic for AI classification."],
+            image_description="",
+            ocr_text="",
+            highlights=[],
+            timeline={"received": _dt.datetime.utcnow().isoformat() + "Z"},
+            env_metadata={},
+            is_potential_duplicate=False,
+            parent_ticket_id=None,
+            sla_breach_at=_sla_breach.isoformat().replace("+00:00", "Z"),
+        )
     
     # --- Context & Environment ---
     import datetime
@@ -779,36 +967,7 @@ async def analyze_only(request_body: TicketRequest):
     summary = text[:100] + ("…" if len(text) > 100 else "") 
 
     # --- Classification ---
-    try:
-        classification_v3_res = classifier_v3.predict(text)
-        if "error" in classification_v3_res:
-            # Fallback to V1
-            classification = classifier_service.predict(text)
-        else:
-            # Parse V3 output
-            cat = classification_v3_res.get("Category", {}).get("prediction", "Unknown")
-            sub = classification_v3_res.get("Subcategory", {}).get("prediction", "Unknown")
-            pri = classification_v3_res.get("priority", {}).get("prediction", "Medium")
-            conf = classification_v3_res.get("Category", {}).get("confidence", 0.0)
-            
-            from backend.services.classifier_service import TEAM_MAP, AUTO_RESOLVE_SUBS
-            assigned_team = TEAM_MAP.get(cat, "General Support")
-            auto_resolve = sub in AUTO_RESOLVE_SUBS
-            
-            classification = {
-                "category": cat,
-                "subcategory": sub,
-                "priority": pri,
-                "auto_resolve": auto_resolve,
-                "assigned_team": assigned_team,
-                "confidence": float(conf)
-            }
-    except Exception as e:
-        traceback.print_exc()
-        classification = {
-            "category": "Unknown", "subcategory": "Unknown", "priority": "Medium",
-            "auto_resolve": False, "assigned_team": "General Support", "confidence": 0.0,
-        }
+    classification = classify_ticket_text(text)
 
     timeline["ai_analyzed"] = get_now_ist()
     timeline["triaged"] = get_now_ist()
@@ -881,7 +1040,7 @@ async def analyze_only(request_body: TicketRequest):
         decision_factors=decision_factors,
         image_description=gemini_analysis["image_description"],
         ocr_text=gemini_analysis["ocr_text"],
-        highlights=entities, # Use entities as highlights for now
+        highlights=[e.get("text", "") for e in entities], # Use entity texts as highlights for now
         timeline=timeline,
         env_metadata=env_metadata,
         sla_breach_at=sla_breach_dt.isoformat() + "Z"
@@ -931,33 +1090,7 @@ async def analyze_stream(request_body: TicketRequest):
         # 3. Classification
         yield f"data: {json.dumps({'step': 'Detecting category and priority', 'status': 'in_progress'})}\n\n"
         await asyncio.sleep(0.2)
-        try:
-            classification_v3_res = classifier_v3.predict(text)
-            if "error" in classification_v3_res:
-                classification = classifier_service.predict(text)
-            else:
-                cat = classification_v3_res.get("Category", {}).get("prediction", "Unknown")
-                sub = classification_v3_res.get("Subcategory", {}).get("prediction", "Unknown")
-                pri = classification_v3_res.get("priority", {}).get("prediction", "Medium")
-                conf = classification_v3_res.get("Category", {}).get("confidence", 0.0)
-                
-                from backend.services.classifier_service import TEAM_MAP, AUTO_RESOLVE_SUBS
-                assigned_team = TEAM_MAP.get(cat, "General Support")
-                auto_resolve = sub in AUTO_RESOLVE_SUBS
-                
-                classification = {
-                    "category": cat,
-                    "subcategory": sub,
-                    "priority": pri,
-                    "auto_resolve": auto_resolve,
-                    "assigned_team": assigned_team,
-                    "confidence": float(conf)
-                }
-        except Exception as e:
-            classification = {
-                "category": "Unknown", "subcategory": "Unknown", "priority": "Medium",
-                "auto_resolve": False, "assigned_team": "General Support", "confidence": 0.0,
-            }
+        classification = classify_ticket_text(text)
         timeline["ai_analyzed"] = get_now_ist()
         timeline["triaged"] = get_now_ist()
 
@@ -1021,7 +1154,7 @@ async def analyze_stream(request_body: TicketRequest):
             "decision_factors": decision_factors,
             "image_description": gemini_analysis["image_description"],
             "ocr_text": gemini_analysis["ocr_text"],
-            "highlights": entities,
+            "highlights": [e.get("text", "") for e in entities],
             "timeline": timeline,
             "env_metadata": env_metadata,
             "sla_breach_at": sla_breach_dt.isoformat() + "Z"
