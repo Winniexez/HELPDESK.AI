@@ -36,6 +36,13 @@ from dotenv import load_dotenv
 env_path = Path(__file__).parent / '.env'
 load_dotenv(dotenv_path=env_path)
 
+# CI smoke tests allow degraded startup so the app can import without heavy ML assets.
+ALLOW_DEGRADED_STARTUP = os.environ.get("ALLOW_DEGRADED_STARTUP", "0") == "1"
+
+
+def _startup_fatal(message: str) -> None:
+    print(f"[Startup-FATAL] {message}")
+
 # Initialize Supabase Client (Service Role for backend bypass)
 try:
     from supabase import create_client, Client
@@ -1292,7 +1299,7 @@ async def analyze_stream(request_body: TicketRequest):
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
-@app.post("/ai/analyze_ticket")
+@app.post("/ai/analyze_ticket/legacy")
 async def legacy_analyze_and_save(request_body: TicketRequest):
     """
     BACKWARD COMPATIBILITY: Strictly performs analysis only. 
