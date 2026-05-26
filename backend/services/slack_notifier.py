@@ -174,3 +174,5 @@ def notify_sla_breach(ticket: dict[str, Any]) -> bool:
         logger.info("SLA breach notification skipped: no Slack webhook (graceful fallback)")
 
     return sent
+
+# PR diff placeholder
