@@ -3,10 +3,18 @@ import base64
 import io
 import re
 import json
-from PIL import Image
-from google import genai
 from dotenv import load_dotenv
 from pathlib import Path
+
+try:
+    from PIL import Image
+    from google import genai
+    _HAS_GEMINI_DEPS = True
+except ImportError:
+    Image = None
+    genai = None
+    _HAS_GEMINI_DEPS = False
+
 
 # Load environment variables from backend/.env
 env_path = Path(__file__).parent.parent / '.env'
@@ -18,7 +26,7 @@ class GeminiService:
         self._initialized = False
         self.model_name = 'gemini-2.5-flash'
         
-        if self.api_key:
+        if self.api_key and _HAS_GEMINI_DEPS:
             try:
                 self.client = genai.Client(api_key=self.api_key)
                 self._initialized = True
@@ -26,15 +34,18 @@ class GeminiService:
             except Exception as e:
                 print(f"[GeminiService] Initialization Error: {e}")
         else:
-            print("[GeminiService] WARNING: GEMINI_API_KEY not found in environment.")
+            if not _HAS_GEMINI_DEPS:
+                print("[GeminiService] WARNING: PIL or google-genai package is not installed. Gemini service is disabled.")
+            else:
+                print("[GeminiService] WARNING: GEMINI_API_KEY not found in environment.")
 
-    def analyze_image(self, image_base64: str) -> dict:
+    def analyze_image(self, image_base64: str, context_text: str = None) -> dict:
         """
         Perform OCR and image analysis using Gemini logic.
         """
-        if not self._initialized:
+        if not self._initialized or not _HAS_GEMINI_DEPS:
             return {
-                "image_description": "[Gemini API Key Missing] Could not analyze image.",
+                "image_description": "[Gemini Service Offline] Could not analyze image.",
                 "ocr_text": "",
                 "detected_problem": ""
             }
@@ -47,6 +58,10 @@ class GeminiService:
 
             prompt = (
                 "Analyze this screenshot from a user reporting a technical issue. "
+            )
+            if context_text:
+                prompt += f"Context/description provided by user: '{context_text}'\n"
+            prompt += (
                 "1. Provide a concise description of what is shown in the image. "
                 "2. Perform OCR and extract any error messages or key text. "
                 "3. Identify the main technical problem depicted. "
